@@ -1,0 +1,6 @@
+[Unit]
+Description=Kali-Sync Synchronisation
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/kali-sync sync

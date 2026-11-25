@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly DEFAULT_MAX_FILE_MB=50
+readonly PRIVATE_KEY_MARKER="BEGIN OPENSSH PRIVATE KEY"
+
+read_max_file_mb_from_config() {
+    local cfg="$1"
+    local line val=""
+
+    [[ -f "$cfg" && -r "$cfg" ]] || return 1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?MAX_FILE_MB=(.*)$ ]]; then
+            val="${BASH_REMATCH[2]}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="${val%"${val##*[![:space:]]}"}"
+            if [[ "$val" == \"*\" && ${#val} -ge 2 ]]; then
+                val="${val#\"}"
+                val="${val%\"}"
+            elif [[ "$val" == \'*\' && ${#val} -ge 2 ]]; then
+                val="${val#\'}"
+                val="${val%\'}"
+            fi
+        fi
+    done < "$cfg"
+
+    [[ -n "$val" ]] || return 1
+    printf '%s\n' "$val"
+}
+
+resolve_max_file_mb() {
+    local raw=""
+    local script_dir cfg
+    local -a cfg_candidates=()
+
+    if [[ -n "${MAX_FILE_MB+x}" ]]; then
+        raw="$MAX_FILE_MB"
+    else
+        if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+            cfg_candidates+=("${XDG_CONFIG_HOME}/kali-sync/config.env")
+        elif [[ -n "${HOME:-}" ]]; then
+            cfg_candidates+=("${HOME}/.config/kali-sync/config.env")
+        fi
+
+        script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+        if [[ -n "$script_dir" ]]; then
+            cfg_candidates+=("${script_dir}/../config.env")
+        fi
+
+        for cfg in "${cfg_candidates[@]}"; do
+            if raw="$(read_max_file_mb_from_config "$cfg")"; then
+                break
+            fi
+        done
+    fi
+
+    if [[ "$raw" =~ ^[0-9]+$ ]] && (( 10#$raw > 0 )); then
+        printf '%d\n' "$((10#$raw))"
+    else
+        printf '%d\n' "$DEFAULT_MAX_FILE_MB"
+    fi
+}
+
+contains_private_key() {
+    local oid="$1"
+    (
+        set +o pipefail
+        git cat-file blob "$oid" 2>/dev/null | LC_ALL=C grep -aFq -- "$PRIVATE_KEY_MARKER"
+    )
+}
+
+main() {
+    local max_file_mb max_bytes against
+    local meta path new_mode new_oid base blob_size
+    local -a violations=()
+
+    max_file_mb="$(resolve_max_file_mb)"
+    max_bytes=$((max_file_mb * 1024 * 1024))
+
+    if git rev-parse --verify HEAD >/dev/null 2>&1; then
+        against="HEAD"
+    else
+        against="$(git hash-object -t tree /dev/null)"
+    fi
+
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+        IFS=' ' read -r _ new_mode _ new_oid _ <<< "$meta"
+
+        if [[ "$new_mode" == "000000" ]]; then
+            continue
+        fi
+
+        if [[ "$new_mode" == "160000" ]]; then
+            violations+=("${path}: eingebettetes Git-Repository (Gitlink, Mode 160000) nicht erlaubt")
+            continue
+        fi
+
+        base="${path##*/}"
+        case "$base" in
+            id_*|*.ovpn|*.kdbx|*.pem)
+                violations+=("${path}: verbotener Secret-Dateiname (${base})")
+                ;;
+        esac
+
+        blob_size="$(git cat-file -s "$new_oid")"
+        if (( blob_size > max_bytes )); then
+            violations+=("${path}: Datei zu groß (${blob_size} Bytes > Limit ${max_file_mb} MiB)")
+        fi
+
+        if contains_private_key "$new_oid"; then
+            violations+=("${path}: enthält '${PRIVATE_KEY_MARKER}'")
+        fi
+    done < <(git diff-index --cached --diff-filter=d -z "$against")
+
+    if (( ${#violations[@]} > 0 )); then
+        printf 'pre-commit: Commit abgelehnt (%d Verstoß/Verstöße):\n' "${#violations[@]}" >&2
+        printf '  - %s\n' "${violations[@]}" >&2
+        exit 1
+    fi
+}
+
+main "$@"

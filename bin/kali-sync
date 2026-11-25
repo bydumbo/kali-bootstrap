@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly END_WHITELIST_MARKER="# END WHITELIST"
+
+_TMP_BACKUP=""
+_TMP_UPDATED=""
+_ROLLBACK_GITIGNORE=""
+
+cleanup_tmp() {
+    if [[ -n "$_ROLLBACK_GITIGNORE" && -n "$_TMP_BACKUP" && -f "$_TMP_BACKUP" ]]; then
+        cp -- "$_TMP_BACKUP" "$_ROLLBACK_GITIGNORE" 2>/dev/null || true
+    fi
+    if [[ -n "$_TMP_BACKUP" ]]; then
+        rm -f -- "$_TMP_BACKUP"
+        _TMP_BACKUP=""
+    fi
+    if [[ -n "$_TMP_UPDATED" ]]; then
+        rm -f -- "$_TMP_UPDATED"
+        _TMP_UPDATED=""
+    fi
+    _ROLLBACK_GITIGNORE=""
+}
+trap cleanup_tmp EXIT
+
+ks() {
+    git --git-dir="$HOME/.kali-sync" --work-tree="$HOME" -C "$HOME" "$@"
+}
+
+die() {
+    printf 'kali-sync: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Verwendung: kali-sync <befehl> [argumente]
+
+Befehle:
+  sync          Änderungen synchronisieren (leise, für den systemd-Timer)
+  now           Änderungen sofort synchronisieren (mit Terminal-Ausgabe)
+  status        Letzten Sync, offene Änderungen und Timer-Status anzeigen
+  log           Letzte 50 Zeilen aus ~/.local/state/kali-sync/sync.log anzeigen
+  add <pfad>    Pfad (relativ zu $HOME oder absolut) zur Whitelist hinzufügen
+EOF
+}
+
+count_end_markers() {
+    local file="$1"
+    local line=""
+    local count=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$END_WHITELIST_MARKER" ]]; then
+            count=$((count + 1))
+        fi
+    done < "$file"
+
+    printf '%d\n' "$count"
+}
+
+whitelist_has_line() {
+    local file="$1"
+    local needle="$2"
+    local line=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$END_WHITELIST_MARKER" ]]; then
+            return 1
+        fi
+        if [[ "$line" == "$needle" ]]; then
+            return 0
+        fi
+    done < "$file"
+
+    return 1
+}
+
+insert_before_end_whitelist() {
+    local src="$1"
+    local dst="$2"
+    shift 2
+    local -a new_lines=("$@")
+    local line="" new_line=""
+
+    while IFS= read -r line; do
+        if [[ "$line" == "$END_WHITELIST_MARKER" ]]; then
+            for new_line in "${new_lines[@]}"; do
+                printf '%s\n' "$new_line"
+            done
+        fi
+        printf '%s\n' "$line"
+    done < "$src" > "$dst"
+
+    if [[ -n "$line" ]]; then
+        if [[ "$line" == "$END_WHITELIST_MARKER" ]]; then
+            for new_line in "${new_lines[@]}"; do
+                printf '%s\n' "$new_line"
+            done >> "$dst"
+        fi
+        printf '%s' "$line" >> "$dst"
+    fi
+}
+
+normalize_home_relpath() {
+    local raw="$1"
+    local home_norm candidate target_norm rel
+
+    if [[ -z "${HOME:-}" || ! -d "$HOME" ]]; then
+        die "HOME ist nicht gesetzt oder kein Verzeichnis."
+    fi
+
+    if [[ -z "$raw" ]]; then
+        die "Pfad darf nicht leer sein."
+    fi
+
+    if [[ "$raw" == *$'\n'* || "$raw" == *$'\r'* ]]; then
+        die "Pfad darf keine Zeilenumbrüche enthalten."
+    fi
+
+    home_norm="$(realpath -m -s -- "$HOME")"
+
+    if [[ "$raw" == /* ]]; then
+        candidate="$raw"
+    else
+        candidate="${home_norm}/${raw}"
+    fi
+
+    target_norm="$(realpath -m -s -- "$candidate")"
+
+    if [[ "$target_norm" == "$home_norm" ]]; then
+        die "Pfad darf nicht \$HOME selbst sein."
+    fi
+
+    if [[ "$home_norm" == "/" ]]; then
+        rel="${target_norm#/}"
+    elif [[ "$target_norm" == "${home_norm}/"* ]]; then
+        rel="${target_norm#"${home_norm}/"}"
+    else
+        die "Pfad liegt außerhalb von \$HOME: ${raw}"
+    fi
+
+    if [[ -z "$rel" ]]; then
+        die "Ungültiger Pfad: ${raw}"
+    fi
+
+    printf '%s\n' "$rel"
+}
+
+rollback_gitignore() {
+    if [[ -n "$_ROLLBACK_GITIGNORE" && -n "$_TMP_BACKUP" && -f "$_TMP_BACKUP" ]]; then
+        cp -- "$_TMP_BACKUP" "$_ROLLBACK_GITIGNORE"
+        _ROLLBACK_GITIGNORE=""
+    fi
+}
+
+cmd_add() {
+    if (( $# != 1 )); then
+        printf 'kali-sync add: genau ein Pfad-Argument erforderlich.\n' >&2
+        usage >&2
+        exit 1
+    fi
+
+    local raw_path="$1"
+    local rel abs_path gitignore end_count
+    local -a parts=()
+    local -a to_add=()
+    local i prefix unignore_parent reignore_children target_rule
+    local covered_by_parent=0
+
+    rel="$(normalize_home_relpath "$raw_path")"
+
+    if [[ "$rel" == ".kali-sync" || "$rel" == ".kali-sync/"* ]]; then
+        die "Das interne Bare-Repository '.kali-sync' kann nicht zur Whitelist hinzugefügt werden."
+    fi
+
+    if [[ ! -d "$HOME/.kali-sync" ]]; then
+        die "Bare-Repository '$HOME/.kali-sync' nicht gefunden."
+    fi
+
+    gitignore="$HOME/.gitignore"
+    if [[ ! -f "$gitignore" ]]; then
+        die "Whitelist-Datei '$gitignore' nicht gefunden."
+    fi
+
+    end_count="$(count_end_markers "$gitignore")"
+    if (( end_count != 1 )); then
+        die "Marker '${END_WHITELIST_MARKER}' muss genau einmal in '${gitignore}' vorkommen (gefunden: ${end_count})."
+    fi
+
+    abs_path="${HOME%/}/${rel}"
+    if [[ ! -e "$abs_path" && ! -L "$abs_path" ]]; then
+        die "Pfad existiert nicht: ${abs_path}"
+    fi
+
+    IFS='/' read -r -a parts <<< "$rel"
+
+    prefix=""
+    for (( i = 0; i < ${#parts[@]} - 1; i++ )); do
+        if [[ -z "$prefix" ]]; then
+            prefix="${parts[i]}"
+        else
+            prefix="${prefix}/${parts[i]}"
+        fi
+
+        unignore_parent="!/${prefix}/"
+        reignore_children="/${prefix}/*"
+
+        if whitelist_has_line "$gitignore" "$unignore_parent"; then
+            if ! whitelist_has_line "$gitignore" "$reignore_children"; then
+                # Elternordner ist bereits rekursiv freigegeben; nicht mit /* einschränken.
+                covered_by_parent=1
+                to_add=()
+                break
+            fi
+        else
+            to_add+=("$unignore_parent")
+            if ! whitelist_has_line "$gitignore" "$reignore_children"; then
+                to_add+=("$reignore_children")
+            fi
+        fi
+    done
+
+    if (( covered_by_parent == 0 )); then
+        if [[ -d "$abs_path" && ! -L "$abs_path" ]]; then
+            target_rule="!/${rel}/"
+        else
+            target_rule="!/${rel}"
+        fi
+
+        if ! whitelist_has_line "$gitignore" "$target_rule"; then
+            to_add+=("$target_rule")
+        fi
+    fi
+
+    if (( ${#to_add[@]} > 0 )); then
+        _TMP_BACKUP="$(mktemp "${TMPDIR:-/tmp}/kali-sync-gitignore-bak.XXXXXX")"
+        _TMP_UPDATED="$(mktemp "${TMPDIR:-/tmp}/kali-sync-gitignore-new.XXXXXX")"
+        cp -- "$gitignore" "$_TMP_BACKUP"
+        insert_before_end_whitelist "$gitignore" "$_TMP_UPDATED" "${to_add[@]}"
+        _ROLLBACK_GITIGNORE="$gitignore"
+        cp -- "$_TMP_UPDATED" "$gitignore"
+    fi
+
+    local check_rc=0
+    local verbose_out=""
+    ks check-ignore --no-index -q -- "$rel" || check_rc=$?
+    if (( check_rc == 0 )); then
+        verbose_out="$(ks check-ignore --no-index -v -- "$rel" || true)"
+        rollback_gitignore
+        die "Pfad '${rel}' wird weiterhin ignoriert (${verbose_out:-unbekannte Regel}); ~/.gitignore unverändert."
+    elif (( check_rc != 1 )); then
+        rollback_gitignore
+        die "Prüfung mit 'ks check-ignore' fehlgeschlagen (Exit ${check_rc}); ~/.gitignore unverändert."
+    fi
+
+    if (( ${#to_add[@]} == 0 )); then
+        printf "kali-sync: '%s' ist bereits freigegeben.\n" "$rel"
+        return 0
+    fi
+
+    if ! ks commit -q --only -m "kali-sync: add ${rel}" -- .gitignore; then
+        rollback_gitignore
+        die "Commit von ~/.gitignore fehlgeschlagen; Änderungen wurden rückgängig gemacht."
+    fi
+
+    _ROLLBACK_GITIGNORE=""
+    cleanup_tmp
+    printf "kali-sync: '%s' zur Whitelist hinzugefügt.\n" "$rel"
+}
+
+rotate_log_if_needed() {
+    local log_file="$1"
+    local size=0
+
+    if [[ -f "$log_file" ]]; then
+        size="$(stat -c '%s' -- "$log_file")"
+        if (( size >= 1048576 )); then
+            mv -f -- "$log_file" "${log_file}.1"
+        fi
+    fi
+}
+
+log_msg() {
+    local log_file="$1"
+    local text="$2"
+    local ts line
+
+    rotate_log_if_needed "$log_file"
+    ts="$(date -Iseconds)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -n "$line" ]]; then
+            printf '%s %s\n' "$ts" "$line" >> "$log_file"
+        fi
+    done <<< "$text"
+}
+
+send_notify() {
+    local msg="$1"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "$msg" >/dev/null 2>&1 || true
+    fi
+}
+
+record_error() {
+    local last_error_file="$1"
+    local err_msg="$2"
+    local prev_err=""
+
+    if [[ -f "$last_error_file" ]]; then
+        prev_err="$(cat -- "$last_error_file")"
+    fi
+
+    if [[ "$err_msg" != "$prev_err" ]]; then
+        printf '%s\n' "$err_msg" > "$last_error_file"
+        send_notify "$err_msg"
+    fi
+}
+
+clear_error_on_success() {
+    local last_error_file="$1"
+    local log_file="$2"
+
+    if [[ -f "$last_error_file" ]]; then
+        rm -f -- "$last_error_file"
+        send_notify "kali-sync: wieder in Ordnung"
+        log_msg "$log_file" "Sync wieder in Ordnung"
+    fi
+}
+
+sync_out() {
+    local verbose="$1"
+    shift
+    if (( verbose )); then
+        printf '%s\n' "$*"
+    fi
+}
+
+rebase_in_progress() {
+    [[ -d "$HOME/.kali-sync/rebase-merge" || -d "$HOME/.kali-sync/rebase-apply" ]]
+}
+
+normalize_single_line() {
+    local raw="$1"
+    printf '%s' "$raw" | tr '\r\n' '  ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+run_sync_locked() {
+    local verbose="$1"
+    local state_dir="$2"
+    local log_file="${state_dir}/sync.log"
+    local last_success_file="${state_dir}/last_success"
+    local last_error_file="${state_dir}/last_error"
+    local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/kali-sync/config.env"
+    local host="" key_mode="plain"
+
+    if [[ ! -d "$HOME/.kali-sync" ]]; then
+        log_msg "$log_file" "Fehler: Bare-Repository '$HOME/.kali-sync' nicht gefunden"
+        record_error "$last_error_file" "kali-sync: Bare-Repository nicht gefunden"
+        sync_out "$verbose" "kali-sync: Bare-Repository '$HOME/.kali-sync' nicht gefunden."
+        return 1
+    fi
+
+    if [[ -f "$config_file" && -r "$config_file" ]]; then
+        # shellcheck source=/dev/null
+        source "$config_file"
+    fi
+
+    key_mode="${KEY_MODE:-plain}"
+    if [[ -n "${MAX_FILE_MB:-}" ]]; then
+        export MAX_FILE_MB
+    fi
+
+    host="$(hostname)"
+
+    # 2. Agent-Prüfung (nur im keychain-Modus)
+    if [[ "$key_mode" == "keychain" ]]; then
+        local keychain_file="$HOME/.keychain/${host}-sh"
+        if [[ ! -f "$keychain_file" ]]; then
+            log_msg "$log_file" "Agent gesperrt, übersprungen"
+            sync_out "$verbose" "kali-sync: Agent gesperrt, übersprungen."
+            return 0
+        fi
+        # shellcheck source=/dev/null
+        source "$keychain_file"
+        if ! ssh-add -l >/dev/null 2>&1; then
+            log_msg "$log_file" "Agent gesperrt, übersprungen"
+            sync_out "$verbose" "kali-sync: Agent gesperrt, übersprungen."
+            return 0
+        fi
+    fi
+
+    # 3. Netz- & Auth-Prüfung
+    local net_out="" net_rc=0
+    net_out="$(
+        export -f ks
+        timeout 15 "$BASH" -c 'ks ls-remote origin HEAD' 2>&1
+    )" || net_rc=$?
+
+    if (( net_rc != 0 )); then
+        local auth_err=""
+        if [[ "$net_out" == *"Permission denied"* ]]; then
+            auth_err="kali-sync: Auth-Fehler (Permission denied)"
+        elif [[ "$net_out" == *"Repository not found"* ]]; then
+            auth_err="kali-sync: Auth-Fehler (Repository not found)"
+        elif [[ "$net_out" == *"Host key verification failed"* ]]; then
+            auth_err="kali-sync: Auth-Fehler (Host key verification failed)"
+        fi
+
+        if [[ -n "$auth_err" ]]; then
+            log_msg "$log_file" "Auth-Fehler bei ls-remote:"$'\n'"${net_out}"
+            record_error "$last_error_file" "$auth_err"
+            sync_out "$verbose" "${auth_err}."
+            return 1
+        fi
+
+        if [[ -n "$net_out" ]]; then
+            log_msg "$log_file" "Offline oder Remote nicht erreichbar, übersprungen (Exit ${net_rc}):"$'\n'"${net_out}"
+        else
+            log_msg "$log_file" "Offline oder Remote nicht erreichbar, übersprungen (Exit ${net_rc})"
+        fi
+        sync_out "$verbose" "kali-sync: Offline, Sync übersprungen."
+        return 0
+    fi
+
+    # 4. Commit
+    local add_out="" add_rc=0
+    add_out="$(ks add -A 2>&1)" || add_rc=$?
+    if (( add_rc != 0 )); then
+        log_msg "$log_file" "Fehler bei ks add -A:"$'\n'"${add_out}"
+        record_error "$last_error_file" "kali-sync: Staging fehlgeschlagen"
+        sync_out "$verbose" "kali-sync: Staging fehlgeschlagen."
+        return 1
+    fi
+
+    local diff_rc=0
+    ks diff --cached --quiet || diff_rc=$?
+    if (( diff_rc > 1 )); then
+        log_msg "$log_file" "Fehler bei ks diff --cached (Exit ${diff_rc})"
+        record_error "$last_error_file" "kali-sync: Statusprüfung fehlgeschlagen"
+        sync_out "$verbose" "kali-sync: Statusprüfung fehlgeschlagen."
+        return 1
+    fi
+
+    local hook_rejected=0
+    local hook_err_msg=""
+    local committed=0
+
+    if (( diff_rc == 1 )); then
+        local commit_out="" commit_rc=0 commit_ts=""
+        commit_ts="$(date -Iseconds)"
+        commit_out="$(ks commit -q -m "auto: ${host} ${commit_ts}" 2>&1)" || commit_rc=$?
+        if (( commit_rc != 0 )); then
+            ks reset -q >/dev/null 2>&1 || true
+            local hook_reason=""
+            hook_reason="$(normalize_single_line "$commit_out")"
+            if [[ -n "$commit_out" ]]; then
+                log_msg "$log_file" "Commit abgelehnt (Index zurückgesetzt):"$'\n'"${commit_out}"
+            else
+                log_msg "$log_file" "Commit abgelehnt (Index zurückgesetzt, Exit ${commit_rc})"
+            fi
+            if [[ -n "$hook_reason" ]]; then
+                hook_err_msg="kali-sync: Commit abgelehnt: ${hook_reason}"
+            else
+                hook_err_msg="kali-sync: Commit abgelehnt"
+            fi
+            hook_rejected=1
+        else
+            committed=1
+            log_msg "$log_file" "Commit erstellt: auto: ${host} ${commit_ts}"
+        fi
+    fi
+
+    # 5. Pull (auch nach abgelehntem Hook)
+    local pre_pull_head="" pre_stash="" post_stash="" unmerged=""
+    pre_pull_head="$(ks rev-parse --verify -q HEAD || true)"
+    pre_stash="$(ks rev-parse --verify -q refs/stash || true)"
+
+    local pull_out="" pull_rc=0
+    pull_out="$(ks pull --rebase --autostash 2>&1)" || pull_rc=$?
+    post_stash="$(ks rev-parse --verify -q refs/stash || true)"
+    unmerged="$(ks ls-files -u 2>/dev/null || true)"
+
+    if (( pull_rc != 0 )) || [[ -n "$unmerged" ]]; then
+        local was_conflict=0
+        if rebase_in_progress; then
+            was_conflict=1
+            ks rebase --abort >/dev/null 2>&1 || true
+        elif [[ -n "$pre_pull_head" && -n "$post_stash" && "$post_stash" != "$pre_stash" ]] \
+             && [[ -n "$unmerged" || "$pull_out" == *"autostash"* ]]; then
+            was_conflict=1
+            ks reset --hard -q "$pre_pull_head" >/dev/null 2>&1 || true
+            ks stash pop -q >/dev/null 2>&1 || true
+        elif [[ -n "$unmerged" || "$pull_out" == *"CONFLICT"* || "$pull_out" == *"Merge conflict"* \
+                || "$pull_out" == *"would be overwritten"* || "$pull_out" == *"could not apply"* ]]; then
+            was_conflict=1
+        fi
+
+        if (( was_conflict )); then
+            local conflict_msg="kali-sync: Konflikt, bitte manuell lösen"
+            if [[ -n "$pull_out" ]]; then
+                log_msg "$log_file" "Pull-Konflikt (Rebase/Autostash abgebrochen):"$'\n'"${pull_out}"
+            else
+                log_msg "$log_file" "Pull-Konflikt (Rebase/Autostash abgebrochen)"
+            fi
+            record_error "$last_error_file" "$conflict_msg"
+            sync_out "$verbose" "${conflict_msg}."
+            return 1
+        fi
+
+        if [[ -n "$pull_out" ]]; then
+            log_msg "$log_file" "Pull fehlgeschlagen (Exit ${pull_rc}):"$'\n'"${pull_out}"
+        else
+            log_msg "$log_file" "Pull fehlgeschlagen (Exit ${pull_rc})"
+        fi
+        record_error "$last_error_file" "kali-sync: Pull fehlgeschlagen"
+        sync_out "$verbose" "kali-sync: Pull fehlgeschlagen."
+        return 1
+    fi
+
+    if (( hook_rejected )); then
+        log_msg "$log_file" "Pull nach abgelehntem Commit erfolgreich; Push ausgelassen"
+        record_error "$last_error_file" "$hook_err_msg"
+        sync_out "$verbose" "${hook_err_msg} (Pull ausgeführt, Push ausgelassen)."
+        return 1
+    fi
+
+    # 6. Push
+    local push_out="" push_rc=0
+    push_out="$(ks push 2>&1)" || push_rc=$?
+    if (( push_rc != 0 )); then
+        if [[ -n "$push_out" ]]; then
+            log_msg "$log_file" "Push fehlgeschlagen (Exit ${push_rc}):"$'\n'"${push_out}"
+        else
+            log_msg "$log_file" "Push fehlgeschlagen (Exit ${push_rc})"
+        fi
+        record_error "$last_error_file" "kali-sync: Push fehlgeschlagen"
+        sync_out "$verbose" "kali-sync: Push fehlgeschlagen."
+        return 1
+    fi
+
+    printf '%s\n' "$(date -Iseconds)" > "$last_success_file"
+    clear_error_on_success "$last_error_file" "$log_file"
+
+    if (( committed )); then
+        log_msg "$log_file" "Sync erfolgreich (Commit, Pull, Push)"
+        sync_out "$verbose" "kali-sync: Sync erfolgreich (Änderungen synchronisiert)."
+    else
+        log_msg "$log_file" "Sync erfolgreich (keine lokalen Änderungen)"
+        sync_out "$verbose" "kali-sync: Sync erfolgreich (aktuell)."
+    fi
+
+    return 0
+}
+
+cmd_sync() {
+    local verbose="$1"
+    local cmd_name="$2"
+    shift 2
+
+    if (( $# != 0 )); then
+        printf 'kali-sync %s: keine zusätzlichen Argumente erwartet.\n' "$cmd_name" >&2
+        usage >&2
+        exit 1
+    fi
+
+    if [[ -z "${HOME:-}" || ! -d "$HOME" ]]; then
+        die "HOME ist nicht gesetzt oder kein Verzeichnis."
+    fi
+
+    local state_dir="${HOME%/}/.local/state/kali-sync"
+    local lock_file="${state_dir}/lock"
+    mkdir -p -- "$state_dir"
+
+    local lock_fd=""
+    exec {lock_fd}>>"$lock_file"
+    if ! flock -n "$lock_fd"; then
+        exec {lock_fd}>&-
+        sync_out "$verbose" "kali-sync: Sync läuft bereits, übersprungen."
+        return 0
+    fi
+
+    local rc=0
+    run_sync_locked "$verbose" "$state_dir" || rc=$?
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+cmd_status() {
+    if (( $# != 0 )); then
+        printf 'kali-sync status: keine zusätzlichen Argumente erwartet.\n' >&2
+        usage >&2
+        exit 1
+    fi
+
+    if [[ -z "${HOME:-}" || ! -d "$HOME" ]]; then
+        die "HOME ist nicht gesetzt oder kein Verzeichnis."
+    fi
+
+    local state_dir="${HOME%/}/.local/state/kali-sync"
+    local last_success_file="${state_dir}/last_success"
+    local last_error_file="${state_dir}/last_error"
+    local last_success="" last_error=""
+
+    if [[ -f "$last_success_file" && -r "$last_success_file" ]]; then
+        last_success="$(cat -- "$last_success_file" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$last_success" ]]; then
+        printf 'Letzter erfolgreicher Sync: %s\n' "$last_success"
+    else
+        printf 'Letzter erfolgreicher Sync: noch nie\n'
+    fi
+
+    if [[ -f "$last_error_file" && -r "$last_error_file" ]]; then
+        last_error="$(cat -- "$last_error_file" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$last_error" ]]; then
+        printf 'Letzter Fehler: %s\n' "$last_error"
+    fi
+
+    printf '\nOffene Änderungen:\n'
+    if [[ ! -d "$HOME/.kali-sync" ]]; then
+        printf '  Bare-Repository nicht gefunden (%s)\n' "$HOME/.kali-sync"
+    else
+        local git_status="" git_rc=0
+        git_status="$(ks status --short 2>&1)" || git_rc=$?
+        if (( git_rc != 0 )); then
+            printf '  Status konnte nicht ermittelt werden (Exit %d)\n' "$git_rc"
+            if [[ -n "$git_status" ]]; then
+                printf '%s\n' "$git_status"
+            fi
+        elif [[ -n "$git_status" ]]; then
+            printf '%s\n' "$git_status"
+        else
+            printf '  keine\n'
+        fi
+    fi
+
+    printf '\nTimer-Status:\n'
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf '  Timer-Status nicht verfügbar (systemctl nicht installiert)\n'
+    else
+        local timer_out="" timer_rc=0
+        timer_out="$(systemctl --user status kali-sync.timer --no-pager 2>&1)" || timer_rc=$?
+        if (( timer_rc == 0 )); then
+            if [[ -n "$timer_out" ]]; then
+                printf '%s\n' "$timer_out"
+            else
+                printf '  aktiv\n'
+            fi
+        else
+            printf '  Timer-Status nicht verfügbar (systemctl Exit %d)\n' "$timer_rc"
+            if [[ -n "$timer_out" ]]; then
+                printf '%s\n' "$timer_out"
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+cmd_log() {
+    if (( $# != 0 )); then
+        printf 'kali-sync log: keine zusätzlichen Argumente erwartet.\n' >&2
+        usage >&2
+        exit 1
+    fi
+
+    if [[ -z "${HOME:-}" || ! -d "$HOME" ]]; then
+        die "HOME ist nicht gesetzt oder kein Verzeichnis."
+    fi
+
+    local log_file="${HOME%/}/.local/state/kali-sync/sync.log"
+    if [[ ! -f "$log_file" ]]; then
+        printf 'Noch kein Sync-Log vorhanden (%s).\n' "$log_file"
+        return 0
+    fi
+
+    tail -n 50 -- "$log_file"
+}
+
+main() {
+    if (( $# < 1 )); then
+        usage >&2
+        exit 1
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        sync)
+            cmd_sync 0 sync "$@"
+            ;;
+        now)
+            cmd_sync 1 now "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        log)
+            cmd_log "$@"
+            ;;
+        add)
+            cmd_add "$@"
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            printf 'kali-sync: unbekannter Befehl: %s\n' "$cmd" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

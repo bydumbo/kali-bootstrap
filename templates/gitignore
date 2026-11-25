@@ -1,0 +1,21 @@
+# Alles ignorieren …
+/*
+# BEGIN WHITELIST (kali-sync add fügt neue Pfade direkt über END ein)
+!/.gitignore
+!/htb/
+!/notes/
+!/scripts/
+!/.zshrc
+!/.tmux.conf
+# END WHITELIST
+
+# Ausschlüsse: stehen immer zuletzt und haben damit das letzte Wort
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.ovpn
+*.kdbx
+id_*
+*.pcap
+*.pcapng

@@ -1,0 +1,10 @@
+[Unit]
+Description=Kali-Sync periodischer Timer
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=${SYNC_INTERVAL}
+Unit=kali-sync.service
+
+[Install]
+WantedBy=timers.target
